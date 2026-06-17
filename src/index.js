@@ -856,6 +856,9 @@ function handleIndex() {
       if (result.broadcast) {
         updateDashboard(result.broadcast);
       }
+      if (result.event) {
+        handleEvent(result.event);
+      }
     }
 
     document.getElementById("breaking-btn").addEventListener("click", () => {

@@ -1,5 +1,11 @@
+# This file describes a Fastly Compute package. To learn more visit:
+# https://www.fastly.com/documentation/reference/compute/fastly-toml
+
+authors = ["Fastly AI Growth <ai-growth@fastly.com>"]
+description = "Real-time notification system demo using Fastly Fanout and SSE"
+language = "javascript"
 manifest_version = 3
 name = "fastly-fanout-notifications"
-description = "Real-time notification system demo using Fastly Fanout and SSE"
-authors = ["Fastly AI Growth <ai-growth@fastly.com>"]
-language = "javascript"
+service_id = "BKmWamddLVjNVxq6Grt3We"
+
+[local_server]

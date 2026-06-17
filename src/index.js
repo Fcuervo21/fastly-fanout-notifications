@@ -79,6 +79,7 @@ function sanitizeEvent(raw) {
 
 const KV_STORE_NAME = "notification_history";
 const KV_MAX_HISTORY = 20;
+const KV_HISTORY_KEY = "recent-events";
 
 function getKVStore() {
   try {
@@ -92,29 +93,25 @@ async function storeEvent(event) {
   const store = getKVStore();
   if (!store) return;
   try {
-    const key = `event:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`;
-    await store.put(key, JSON.stringify(event), { ttl: 86400 });
-  } catch {
-    // KV write failure is non-fatal
-  }
+    let events = [];
+    const existing = await store.get(KV_HISTORY_KEY);
+    if (existing) {
+      try { events = await existing.json(); } catch {}
+    }
+    events.unshift(event);
+    if (events.length > KV_MAX_HISTORY) events = events.slice(0, KV_MAX_HISTORY);
+    await store.put(KV_HISTORY_KEY, JSON.stringify(events));
+  } catch {}
 }
 
 async function getRecentEvents() {
   const store = getKVStore();
   if (!store) return [];
   try {
-    const { list: keys } = await store.list({ prefix: "event:", limit: KV_MAX_HISTORY });
-    const events = [];
-    for (const key of keys) {
-      try {
-        const entry = await store.get(key);
-        if (entry) events.push(await entry.json());
-      } catch {
-        // skip corrupted entries
-      }
-    }
-    events.sort((a, b) => (b.payload?.timestamp || 0) - (a.payload?.timestamp || 0));
-    return events.slice(0, KV_MAX_HISTORY);
+    const entry = await store.get(KV_HISTORY_KEY);
+    if (!entry) return [];
+    const events = await entry.json();
+    return Array.isArray(events) ? events.slice(0, KV_MAX_HISTORY) : [];
   } catch {
     return [];
   }
@@ -311,7 +308,7 @@ async function handlePublish(event) {
   );
 }
 
-const DEMO_BUDGET_PER_HOUR = 5;
+const DEMO_BUDGET_PER_HOUR = 20;
 const DEMO_GLOBAL_PER_MINUTE = 10;
 
 async function handleDemoPublish(event) {

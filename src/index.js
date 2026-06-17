@@ -43,6 +43,22 @@ class EventBus {
 const eventBus = new EventBus();
 let subscriberIdCounter = 0;
 
+const PUBLISH_TOKEN = "demo-publish-token-fastly-fanout";
+
+function sanitizeEvent(raw) {
+  const parsed = JSON.parse(JSON.stringify(raw));
+
+  if (!parsed.type || !parsed.payload) {
+    throw new Error("Event must have 'type' and 'payload' fields");
+  }
+
+  const clean = JSON.parse(
+    JSON.stringify(parsed).replace(/<script[\s\S]*?<\/script>/gi, "")
+  );
+
+  return clean;
+}
+
 addEventListener("fetch", (event) => event.respondWith(handleRequest(event)));
 
 async function handleRequest(event) {
@@ -51,6 +67,8 @@ async function handleRequest(event) {
   switch (url.pathname) {
     case "/subscribe":
       return handleSubscribe(event);
+    case "/publish":
+      return handlePublish(event);
     default:
       return new Response("Not Found", { status: 404 });
   }
@@ -76,4 +94,55 @@ function handleSubscribe(event) {
       "Grip-Channel": "notifications",
     },
   });
+}
+
+async function handlePublish(event) {
+  if (event.request.method !== "POST") {
+    return new Response("Method Not Allowed", { status: 405 });
+  }
+
+  const token = event.request.headers.get("X-Publish-Token");
+  if (token !== PUBLISH_TOKEN) {
+    return new Response(JSON.stringify({ error: "Unauthorized" }), {
+      status: 401,
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+
+  let body;
+  try {
+    body = await event.request.json();
+  } catch (e) {
+    return new Response(JSON.stringify({ error: "Invalid JSON body" }), {
+      status: 400,
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+
+  let sanitized;
+  try {
+    sanitized = sanitizeEvent(body);
+  } catch (e) {
+    return new Response(JSON.stringify({ error: e.message }), {
+      status: 400,
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+
+  const stats = eventBus.publish(sanitized);
+
+  return new Response(
+    JSON.stringify({
+      success: true,
+      event: sanitized,
+      broadcast: stats,
+    }),
+    {
+      status: 200,
+      headers: {
+        "Content-Type": "application/json",
+        "Access-Control-Allow-Origin": "*",
+      },
+    }
+  );
 }

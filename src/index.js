@@ -888,7 +888,7 @@ function handleIndex() {
     connectSSE();
   </script>
 </body>
-</html>\`;
+</html>`;
 
   return new Response(html, {
     status: 200,

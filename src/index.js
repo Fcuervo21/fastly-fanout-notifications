@@ -100,7 +100,7 @@ async function storeEvent(event) {
     }
     events.unshift(event);
     if (events.length > KV_MAX_HISTORY) events = events.slice(0, KV_MAX_HISTORY);
-    await store.put(KV_HISTORY_KEY, JSON.stringify(events));
+    await store.put(KV_HISTORY_KEY, JSON.stringify(events), { ttl: 3600 });
   } catch {}
 }
 

@@ -1,0 +1,5 @@
+manifest_version = 3
+name = "fastly-fanout-notifications"
+description = "Real-time notification system demo using Fastly Fanout and SSE"
+authors = ["Fastly AI Growth <ai-growth@fastly.com>"]
+language = "javascript"

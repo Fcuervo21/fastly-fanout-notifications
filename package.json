@@ -1,0 +1,14 @@
+{
+  "name": "fastly-fanout-notifications",
+  "version": "1.0.0",
+  "description": "Real-time notification system demo using Fastly Compute and Fanout SSE",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "build": "js-compute-runtime src/index.js bin/main.wasm",
+    "start": "fastly compute serve"
+  },
+  "devDependencies": {
+    "@fastly/js-compute": "^3.0.0"
+  }
+}

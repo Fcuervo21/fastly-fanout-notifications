@@ -700,7 +700,192 @@ function handleIndex() {
   </div>
 
   <script>
-    // Frontend JavaScript will be added in Task 5
+    const PUBLISH_TOKEN = "demo-publish-token-fastly-fanout";
+    let homeScore = 0;
+    let awayScore = 0;
+
+    const breakingHeadlines = [
+      "Major trade deal announced between division rivals",
+      "Star player returns from injury ahead of schedule",
+      "Championship venue confirmed for next season",
+      "Record-breaking transfer fee accepted",
+      "Coach fired after surprising loss in playoffs",
+      "League announces new expansion team",
+    ];
+    let headlineIndex = 0;
+
+    // --- SSE Connection ---
+    function connectSSE() {
+      const evtSource = new EventSource("/subscribe");
+      const dot = document.getElementById("connection-dot");
+      const status = document.getElementById("connection-status");
+
+      evtSource.addEventListener("connected", (e) => {
+        dot.classList.remove("disconnected");
+        status.textContent = "Connected";
+      });
+
+      evtSource.addEventListener("notification", (e) => {
+        const event = JSON.parse(e.data);
+        handleEvent(event);
+      });
+
+      evtSource.onerror = () => {
+        dot.classList.add("disconnected");
+        status.textContent = "Reconnecting...";
+      };
+
+      evtSource.onopen = () => {
+        dot.classList.remove("disconnected");
+        status.textContent = "Connected";
+      };
+    }
+
+    // --- Event Handlers ---
+    function handleEvent(event) {
+      if (event.type === "breaking-news") {
+        showBreakingNews(event.payload);
+      } else if (event.type === "score-update") {
+        updateScore(event.payload);
+      }
+      addLogEntry(event);
+    }
+
+    function showBreakingNews(payload) {
+      const banner = document.getElementById("news-banner");
+      const headline = document.getElementById("news-headline");
+      const time = document.getElementById("news-time");
+
+      banner.classList.remove("active");
+
+      requestAnimationFrame(() => {
+        requestAnimationFrame(() => {
+          headline.textContent = payload.headline;
+          time.textContent = new Date(payload.timestamp).toLocaleTimeString();
+          banner.classList.add("active");
+        });
+      });
+    }
+
+    function updateScore(payload) {
+      const homeEl = document.getElementById("home-score");
+      const awayEl = document.getElementById("away-score");
+
+      homeEl.textContent = payload.homeScore;
+      awayEl.textContent = payload.awayScore;
+
+      const changed = payload.homeScore > homeScore ? homeEl : awayEl;
+      changed.classList.add("bumped");
+      setTimeout(() => changed.classList.remove("bumped"), 300);
+
+      homeScore = payload.homeScore;
+      awayScore = payload.awayScore;
+    }
+
+    // --- Dashboard ---
+    function updateDashboard(broadcastStats) {
+      document.getElementById("connections-count").textContent = broadcastStats.subscribers;
+      document.getElementById("payload-size").textContent = broadcastStats.payloadBytes + " bytes";
+      document.getElementById("broadcast-latency").textContent = broadcastStats.broadcastMs + " ms";
+    }
+
+    function addLogEntry(event) {
+      const log = document.getElementById("event-log");
+      const entry = document.createElement("div");
+      entry.className = "log-entry";
+
+      const time = document.createElement("span");
+      time.className = "log-time";
+      time.textContent = new Date().toLocaleTimeString();
+
+      const type = document.createElement("span");
+      type.className = "log-type";
+      type.textContent = event.type;
+
+      const detail = document.createElement("span");
+      detail.className = "log-detail";
+      detail.textContent = event.type === "breaking-news"
+        ? event.payload.headline
+        : "Score: " + event.payload.homeScore + " - " + event.payload.awayScore;
+
+      entry.appendChild(time);
+      entry.appendChild(type);
+      entry.appendChild(detail);
+      log.prepend(entry);
+
+      while (log.children.length > 50) {
+        log.removeChild(log.lastChild);
+      }
+    }
+
+    // --- Architecture Animation ---
+    function animateArchDiagram() {
+      const dots = [
+        document.getElementById("arch-dot-1"),
+        document.getElementById("arch-dot-2"),
+        document.getElementById("arch-dot-3"),
+      ];
+      const eventbusNode = document.getElementById("eventbus-node");
+
+      dots.forEach((dot, i) => {
+        dot.classList.remove("animate");
+        void dot.offsetWidth;
+        setTimeout(() => dot.classList.add("animate"), i * 400);
+      });
+
+      setTimeout(() => {
+        eventbusNode.classList.add("glow");
+        setTimeout(() => eventbusNode.classList.remove("glow"), 600);
+      }, 800);
+    }
+
+    // --- Publish Actions ---
+    async function publish(eventData) {
+      animateArchDiagram();
+
+      const res = await fetch("/publish", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Publish-Token": PUBLISH_TOKEN,
+        },
+        body: JSON.stringify(eventData),
+      });
+
+      const result = await res.json();
+      if (result.broadcast) {
+        updateDashboard(result.broadcast);
+      }
+    }
+
+    document.getElementById("breaking-btn").addEventListener("click", () => {
+      const headline = breakingHeadlines[headlineIndex % breakingHeadlines.length];
+      headlineIndex++;
+      publish({
+        type: "breaking-news",
+        payload: {
+          headline: headline,
+          timestamp: Date.now(),
+        },
+      });
+    });
+
+    document.getElementById("score-btn").addEventListener("click", () => {
+      const isHome = Math.random() > 0.5;
+      publish({
+        type: "score-update",
+        payload: {
+          homeTeam: "HOME",
+          awayTeam: "AWAY",
+          homeScore: isHome ? homeScore + 1 : homeScore,
+          awayScore: isHome ? awayScore : awayScore + 1,
+          timestamp: Date.now(),
+        },
+      });
+    });
+
+    // --- Init ---
+    connectSSE();
   </script>
 </body>
 </html>\`;

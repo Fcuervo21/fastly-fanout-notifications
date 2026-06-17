@@ -2,6 +2,8 @@
 
 A live demo of edge-side real-time notifications using **Fastly Compute**, **Fastly Fanout**, and **KV Store** with Server-Sent Events (SSE). Inspired by how Bleacher Report delivers millions of live score updates and breaking news alerts at the edge.
 
+**Live demo:** [https://personally-exact-frog.edgecompute.app](https://personally-exact-frog.edgecompute.app)
+
 ## Problem Statement
 
 Real-time notifications at scale are hard. Traditional approaches require:
@@ -18,10 +20,10 @@ These challenges multiply as users spread across geographies. Delivering a score
 
 | Fastly Product | What It Provides |
 |---|---|
-| **Fastly Compute** | Runs application logic at the edge in a WebAssembly sandbox. Handles routing, authentication, and event sanitization. |
+| **Fastly Compute** | Runs application logic at the edge in a WebAssembly sandbox. Handles routing, authentication, event sanitization, and rate limiting. |
 | **Fastly Fanout** | Manages persistent SSE connections at edge PoPs using the open GRIP protocol. One publish call delivers to all subscribers globally. |
-| **KV Store** | Persists notification history at the edge. New subscribers receive recent events on connect. |
-| **Secret Store** | Securely stores the Fastly API token used to publish to Fanout channels. |
+| **KV Store** | Persists notification history for replay on connect. Also enforces per-IP budgets and global rate limits server-side. |
+| **Secret Store** | Securely stores the Fastly API token used to publish to Fanout channels. No secrets are exposed in client-side code. |
 | **Edge PoPs (90+)** | Connections terminate at the nearest PoP. No round-trip to origin for each client. |
 
 Compared to alternatives:
@@ -64,11 +66,11 @@ Clients (global)            Fastly Edge (90+ PoPs)          Origin
 │ Client N ├──GET /subscribe──►│  → GRIP hold at edge      │     │              │
 └──────────┘                │  + KV history replay      │     │              │
                             └───────────┬─────────────┘     │  POST         │
-                                        │                   │  /publish     │
-                                        │◄── Fanout API ────│  → KV Store   │
-                                        │   http-stream     │  → Fanout API │
-                                        ▼                   └──────────────┘
-                              All subscribers receive
+                                        │                   │  /demo-publish│
+                                        │◄── Fanout API ────│  → KV budget  │
+                                        │   http-stream     │  → KV Store   │
+                                        ▼                   │  → Fanout API │
+                              All subscribers receive       └──────────────┘
                               the SSE frame instantly
 ```
 
@@ -81,10 +83,33 @@ Clients (global)            Fastly Edge (90+ PoPs)          Origin
 
 **Production publish path:**
 
-1. Origin receives `POST /publish` with auth token
-2. Sanitizes event, stores in KV Store
-3. Publishes to Fanout API (`POST /service/{id}/publish/`) with `http-stream` format
-4. Fanout delivers the SSE frame to all subscribers across all PoPs
+1. Browser sends `POST /demo-publish` (no token needed — budget enforced server-side)
+2. Server checks per-IP budget (5/hour) and global rate limit (10/min) via KV Store
+3. Sanitizes event, stores in KV Store for history replay
+4. Publishes to Fanout API (`POST /service/{id}/publish/`) with `http-stream` format
+5. Fanout delivers the SSE frame to all subscribers across all PoPs
+
+### Demo Resource Protection
+
+This demo is designed to be safe to leave running publicly:
+
+| Layer | Mechanism | Limit |
+|---|---|---|
+| **Per-IP budget** | KV Store keyed by IP hash + hour | 5 interactive clicks per IP per hour |
+| **Global rate limit** | KV Store keyed by minute | 10 publishes per minute across all visitors |
+| **Auto-demo mode** | Client-side JS | After budget exhaustion, simulated events stream locally at zero server cost |
+| **No exposed secrets** | Secret Store | Publish token and API keys are never in the HTML source |
+
+The frontend calls `/demo-publish` (no auth token). The authenticated `/publish` endpoint exists for API use and validates tokens against the Secret Store.
+
+### Endpoints
+
+| Route | Method | Auth | Description |
+|---|---|---|---|
+| `/` | GET | None | Full HTML/CSS/JS UI |
+| `/subscribe` | GET | None | SSE stream — Fanout in production, EventBus locally. Replays KV history on connect. |
+| `/demo-publish` | POST | Per-IP budget (KV Store) | Browser-facing publish. Budget-limited, no token needed. |
+| `/publish` | POST | `X-Publish-Token` header | API publish. Token validated against Secret Store (production) or hardcoded fallback (local). |
 
 ## Prerequisites
 
@@ -92,12 +117,6 @@ Clients (global)            Fastly Edge (90+ PoPs)          Origin
 - **Fastly CLI** — `brew install fastly/tap/fastly` or see [install docs](https://www.fastly.com/documentation/reference/tools/cli/)
 - **Node.js** 18+ — required by the `@fastly/js-compute` build toolchain
 - **npm** — ships with Node.js
-
-For production Fanout:
-
-- Enable Fanout on your Fastly Compute service (in the Fastly control panel under service settings)
-- Create a KV Store named `notification-history` (provisioned automatically by `fastly compute publish`)
-- Create a Secret Store named `fanout-secrets` with a `fastly-api-token` entry containing a Fastly API token with publish permissions
 
 ## Deployment Instructions
 
@@ -110,7 +129,7 @@ npm install
 fastly compute serve
 ```
 
-Open [http://127.0.0.1:7676](http://127.0.0.1:7676) in your browser. Click **"Send Breaking News"** or **"Increment Score"** to see the notification flow in real time.
+Open [http://127.0.0.1:7676](http://127.0.0.1:7676) in your browser. Click **"Send Breaking News"** or **"Increment Score"** to see the notification flow in real time. Locally, the demo uses EventBus (in-memory) and the hardcoded publish token.
 
 ### Deploy to Fastly Edge
 
@@ -118,27 +137,40 @@ Open [http://127.0.0.1:7676](http://127.0.0.1:7676) in your browser. Click **"Se
 fastly compute publish
 ```
 
-The CLI will prompt you to create or select a Fastly service and automatically provision the `notification-history` KV Store. Once deployed, your service runs at the assigned `.edgecompute.app` domain.
+The CLI will prompt you to create or select a Fastly service. Once deployed, your service runs at the assigned `.edgecompute.app` domain.
 
-To deploy non-interactively:
+**After the first deploy, you must manually add two backends** (the `[setup.backends]` in `fastly.toml` only runs on initial service creation):
 
 ```bash
-fastly compute publish --non-interactive --accept-defaults
+# Clone the active version to edit it
+fastly service-version clone --service-id <SERVICE_ID> --version active
+
+# Add the self backend (Fanout routes requests back to your service)
+fastly backend create --service-id <SERVICE_ID> --version <NEW_VERSION> \
+  --name self \
+  --address <YOUR_DOMAIN>.edgecompute.app --port 443 \
+  --use-ssl --ssl-sni-hostname <YOUR_DOMAIN>.edgecompute.app \
+  --override-host <YOUR_DOMAIN>.edgecompute.app
+
+# Add the Fanout publish backend (for broadcasting events)
+fastly backend create --service-id <SERVICE_ID> --version <NEW_VERSION> \
+  --name fanout_publish \
+  --address api.fastly.com --port 443 \
+  --use-ssl --ssl-sni-hostname api.fastly.com \
+  --override-host api.fastly.com
+
+# Activate the version with backends
+fastly service-version activate --service-id <SERVICE_ID> --version <NEW_VERSION>
 ```
 
 ### Enable Fanout (production real-time)
 
-After deploying, enable Fanout for cross-client real-time delivery:
-
-1. In the [Fastly control panel](https://manage.fastly.com/), navigate to your service settings
-2. Enable Fanout
-3. Create a Secret Store named `fanout-secrets`:
-   ```bash
-   fastly secret-store create --name fanout-secrets
-   fastly secret-store-entry create --store-id <STORE_ID> --name fastly-api-token --secret <YOUR_API_TOKEN>
-   fastly resource-link create --service-id <SERVICE_ID> --version latest --resource-id <STORE_ID>
-   ```
-4. Activate the new version
+1. In the [Fastly control panel](https://manage.fastly.com/), navigate to your service → **Settings** → **Product Enablement** → toggle **Fanout** on
+2. Create a **KV Store** named `notification_history` and link it to your service
+3. Create a **Secret Store** named `fastly_fanout` and link it to your service, with these entries:
+   - `fastly-api-token` — a Fastly API token with publish permissions
+   - `publish-token` (optional) — a custom token for the authenticated `/publish` endpoint
+4. Activate the new service version
 
 ## Validation / Smoke Test
 
@@ -154,40 +186,46 @@ curl -s -N --max-time 3 http://127.0.0.1:7676/subscribe
 # Expected: event: connected with mode: "local" (or "fanout" on edge)
 # Followed by any recently published events from KV Store
 
-# 3. Publish with valid token returns success
-curl -s -X POST http://127.0.0.1:7676/publish \
+# 3. Demo publish (no token needed, budget-limited)
+curl -s -X POST http://127.0.0.1:7676/demo-publish \
   -H "Content-Type: application/json" \
-  -H "X-Publish-Token: demo-publish-token-fastly-fanout" \
   -d '{"type":"breaking-news","payload":{"headline":"Test alert","timestamp":1718640000000}}'
 # Expected: {"success":true,"event":{...},"broadcast":{...,"mode":"local"}}
 
-# 4. Publish without token returns 401
+# 4. Authenticated publish with token
+curl -s -X POST http://127.0.0.1:7676/publish \
+  -H "Content-Type: application/json" \
+  -H "X-Publish-Token: demo-publish-token-fastly-fanout" \
+  -d '{"type":"breaking-news","payload":{"headline":"Test","timestamp":1718640000000}}'
+# Expected: {"success":true,...}
+
+# 5. Publish without token returns 401
 curl -s -X POST http://127.0.0.1:7676/publish \
   -H "Content-Type: application/json" \
   -d '{"type":"breaking-news","payload":{"headline":"Test","timestamp":0}}'
 # Expected: {"error":"Unauthorized"}
 
-# 5. Security headers present
+# 6. Security headers present
 curl -s -I http://127.0.0.1:7676/ | grep -iE '(x-content-type|x-frame|content-security)'
 # Expected:
 #   content-security-policy: default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'
 #   x-content-type-options: nosniff
 #   x-frame-options: DENY
 
-# 6. Unknown routes return 404
+# 7. Unknown routes return 404
 curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:7676/nonexistent
 # Expected: 404
 ```
 
 ## Production Considerations
 
-- **Replace the demo publish token.** The hardcoded `X-Publish-Token` is for demo purposes only. In production, validate against a secret stored in a Fastly Secret Store.
 - **Validate `Grip-Sig`.** In production with Fanout enabled, requests relayed through Fanout carry a `Grip-Sig` JWT header signed by Fastly. Validate this signature to distinguish Fanout-relayed requests from direct ones.
 - **TLS.** All Fastly edge traffic is served over TLS by default. Ensure your origin (if external) also uses HTTPS.
 - **Origin protection.** Use [Fastly shielding](https://www.fastly.com/documentation/guides/concepts/shielding/) and origin authentication headers to prevent direct access to your origin.
-- **KV Store consistency.** KV Store is eventually consistent. A just-published event might not appear in the history for a subscriber connecting milliseconds later. The frontend handles this by also processing events from the publish response directly.
+- **KV Store consistency.** KV Store is eventually consistent. A just-published event might not appear in the history for a subscriber connecting milliseconds later.
 - **Channel design.** For high-scale deployments, segment channels (e.g., per-topic, per-region) rather than using a single global channel.
 - **Keep-alive.** The `Grip-Keep-Alive` header configures Fanout to send periodic heartbeat frames to keep connections alive through proxies and load balancers.
+- **Backend persistence.** `fastly compute publish` creates a fresh service version. If your backends were added manually (not via `[setup]`), clone the active version after publish and activate the clone to preserve them.
 
 ## Teardown / Cleanup
 
@@ -205,14 +243,11 @@ fastly service delete --service-id SERVICE_ID
 ### Remove the KV Store
 
 ```bash
-# List KV stores to find the store ID
 fastly kv-store list
-
-# Delete the notification history store
 fastly kv-store delete --store-id STORE_ID
 ```
 
-### Remove the Secret Store (if created)
+### Remove the Secret Store
 
 ```bash
 fastly secret-store list
@@ -229,8 +264,8 @@ rm -rf bin/ pkg/ node_modules/
 
 - **Runtime:** JavaScript on [Fastly Compute](https://www.fastly.com/products/compute)
 - **Real-time:** [Fastly Fanout](https://www.fastly.com/products/fanout) (GRIP protocol)
-- **Storage:** [Fastly KV Store](https://www.fastly.com/products/kv-store) for notification history
-- **Secrets:** [Fastly Secret Store](https://docs.fastly.com/en/guides/working-with-secret-stores) for API tokens
+- **Storage:** [Fastly KV Store](https://www.fastly.com/products/kv-store) — notification history, per-IP budgets, rate limiting
+- **Secrets:** [Fastly Secret Store](https://docs.fastly.com/en/guides/working-with-secret-stores) — API tokens, publish auth
 - **Transport:** Server-Sent Events (SSE) via the standard `EventSource` browser API
 - **Frontend:** Vanilla HTML/CSS/JS — no framework, no build step
 - **Local dev:** [Viceroy](https://github.com/fastly/Viceroy) via `fastly compute serve`

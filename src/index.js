@@ -77,7 +77,7 @@ function sanitizeEvent(raw) {
   return clean;
 }
 
-const KV_STORE_NAME = "notification-history";
+const KV_STORE_NAME = "notification_history";
 const KV_MAX_HISTORY = 20;
 
 function getKVStore() {
@@ -125,7 +125,7 @@ async function fanoutPublish(event) {
   const serviceId = env("FASTLY_SERVICE_ID");
   if (!serviceId) throw new Error("No service ID");
 
-  const secrets = new SecretStore("fanout-secrets");
+  const secrets = new SecretStore("fastly_fanout");
   const tokenEntry = await secrets.get("fastly-api-token");
   if (!tokenEntry) throw new Error("No API token");
   const apiToken = tokenEntry.plaintext();
@@ -170,6 +170,8 @@ async function handleRequest(event) {
       return handleSubscribe(event);
     case "/publish":
       return handlePublish(event);
+    case "/demo-publish":
+      return handleDemoPublish(event);
     default:
       return secureResponse("Not Found", { status: 404 });
   }
@@ -239,7 +241,21 @@ async function handlePublish(event) {
   }
 
   const token = event.request.headers.get("X-Publish-Token");
-  if (token !== PUBLISH_TOKEN) {
+  if (!token) {
+    return secureResponse(JSON.stringify({ error: "Unauthorized" }), {
+      status: 401,
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+
+  let authorized = false;
+  try {
+    const secrets = new SecretStore("fastly_fanout");
+    const entry = await secrets.get("publish-token");
+    if (entry && entry.plaintext() === token) authorized = true;
+  } catch {}
+  if (!authorized && token === PUBLISH_TOKEN) authorized = true;
+  if (!authorized) {
     return secureResponse(JSON.stringify({ error: "Unauthorized" }), {
       status: 401,
       headers: { "Content-Type": "application/json" },
@@ -249,7 +265,7 @@ async function handlePublish(event) {
   let body;
   try {
     body = await event.request.json();
-  } catch (e) {
+  } catch {
     return secureResponse(JSON.stringify({ error: "Invalid JSON body" }), {
       status: 400,
       headers: { "Content-Type": "application/json" },
@@ -259,7 +275,7 @@ async function handlePublish(event) {
   let sanitized;
   try {
     sanitized = sanitizeEvent(body);
-  } catch (e) {
+  } catch {
     return secureResponse(JSON.stringify({ error: "Invalid event format" }), {
       status: 400,
       headers: { "Content-Type": "application/json" },
@@ -291,6 +307,92 @@ async function handlePublish(event) {
       headers: {
         "Content-Type": "application/json",
       },
+    }
+  );
+}
+
+const DEMO_BUDGET_PER_HOUR = 5;
+const DEMO_GLOBAL_PER_MINUTE = 10;
+
+async function handleDemoPublish(event) {
+  if (event.request.method !== "POST") {
+    return secureResponse("Method Not Allowed", { status: 405 });
+  }
+
+  const clientIp = event.client?.address || event.request.headers.get("fastly-client-ip") || "unknown";
+  const ipHash = Array.from(new TextEncoder().encode(clientIp)).reduce((h, b) => ((h << 5) - h + b) | 0, 0).toString(36);
+
+  const store = getKVStore();
+  if (store) {
+    try {
+      const hourKey = `demo:${ipHash}:${Math.floor(Date.now() / 3600000)}`;
+      const existing = await store.get(hourKey);
+      const count = existing ? parseInt(await existing.text(), 10) || 0 : 0;
+      if (count >= DEMO_BUDGET_PER_HOUR) {
+        return secureResponse(JSON.stringify({ error: "Demo budget reached. Events will continue automatically.", budgetExhausted: true }), {
+          status: 429,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+
+      const minuteKey = `rate:${Math.floor(Date.now() / 60000)}`;
+      const rateEntry = await store.get(minuteKey);
+      const rateCount = rateEntry ? parseInt(await rateEntry.text(), 10) || 0 : 0;
+      if (rateCount >= DEMO_GLOBAL_PER_MINUTE) {
+        return secureResponse(JSON.stringify({ error: "Rate limit exceeded. Try again shortly." }), {
+          status: 429,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+
+      await store.put(hourKey, String(count + 1), { ttl: 3600 });
+      await store.put(minuteKey, String(rateCount + 1), { ttl: 120 });
+    } catch {}
+  }
+
+  let body;
+  try {
+    body = await event.request.json();
+  } catch {
+    return secureResponse(JSON.stringify({ error: "Invalid JSON body" }), {
+      status: 400,
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+
+  let sanitized;
+  try {
+    sanitized = sanitizeEvent(body);
+  } catch {
+    return secureResponse(JSON.stringify({ error: "Invalid event format" }), {
+      status: 400,
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+
+  const storePromise = storeEvent(sanitized);
+
+  let stats;
+  let mode;
+  try {
+    stats = await fanoutPublish(sanitized);
+    mode = "fanout";
+  } catch {
+    stats = eventBus.publish(sanitized);
+    mode = "local";
+  }
+
+  await storePromise.catch(() => {});
+
+  return secureResponse(
+    JSON.stringify({
+      success: true,
+      event: sanitized,
+      broadcast: { ...stats, mode },
+    }),
+    {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
     }
   );
 }
@@ -437,9 +539,36 @@ function handleIndex() {
       box-shadow: var(--shadow-sm);
     }
 
-    .btn-score:hover {
+    .btn-score:hover:not(:disabled) {
       background: var(--primary-hover);
       box-shadow: var(--shadow-md);
+    }
+
+    .publish-btn:disabled {
+      opacity: 0.4;
+      cursor: not-allowed;
+      transform: none;
+    }
+
+    .budget-notice {
+      font-size: 12px;
+      color: var(--text-muted);
+      text-align: center;
+      margin-top: 8px;
+      line-height: 1.4;
+    }
+
+    .auto-badge {
+      display: inline-block;
+      font-size: 10px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+      padding: 3px 8px;
+      border-radius: 4px;
+      background: var(--primary-light);
+      color: var(--primary);
+      margin-top: 8px;
     }
 
     /* Phone Mockup */
@@ -807,6 +936,7 @@ function handleIndex() {
           Increment Score +1
         </button>
       </div>
+      <div class="budget-notice" id="budget-notice"></div>
     </div>
 
     <!-- Phone Mockup -->
@@ -894,7 +1024,6 @@ function handleIndex() {
   </div>
 
   <script>
-    const PUBLISH_TOKEN = "demo-publish-token-fastly-fanout";
     let homeScore = 0;
     let awayScore = 0;
 
@@ -916,6 +1045,7 @@ function handleIndex() {
 
       evtSource.addEventListener("connected", (e) => {
         const data = JSON.parse(e.data);
+        window._connectionMode = data.mode;
         dot.classList.remove("disconnected");
         status.textContent = "Connected";
 
@@ -1050,29 +1180,52 @@ function handleIndex() {
       }, 800);
     }
 
-    // --- Publish Actions ---
+    // --- Publish Actions (server-enforced budget) ---
+    const PUBLISH_COOLDOWN = 1500;
+    let lastPublish = 0;
+    let budgetExhausted = false;
+    const breakingBtn = document.getElementById("breaking-btn");
+    const scoreBtn = document.getElementById("score-btn");
+    const budgetNotice = document.getElementById("budget-notice");
+
+    function enterAutoMode() {
+      if (budgetExhausted) return;
+      budgetExhausted = true;
+      breakingBtn.disabled = true;
+      scoreBtn.disabled = true;
+      budgetNotice.innerHTML = '<span class="auto-badge">Auto-Demo Active</span><br>Live events stream automatically. Open another tab to see real-time sync.';
+      startAutoDemo();
+    }
+
     async function publish(eventData) {
+      if (budgetExhausted) return;
+      const now = Date.now();
+      if (now - lastPublish < PUBLISH_COOLDOWN) return;
+      lastPublish = now;
       animateArchDiagram();
 
-      const res = await fetch("/publish", {
+      const res = await fetch("/demo-publish", {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "X-Publish-Token": PUBLISH_TOKEN,
-        },
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify(eventData),
       });
 
       const result = await res.json();
+
+      if (res.status === 429 && result.budgetExhausted) {
+        enterAutoMode();
+        return;
+      }
+
       if (result.broadcast) {
         updateDashboard(result.broadcast);
       }
-      if (result.event) {
+      if (result.event && window._connectionMode !== "fanout") {
         handleEvent(result.event);
       }
     }
 
-    document.getElementById("breaking-btn").addEventListener("click", () => {
+    breakingBtn.addEventListener("click", () => {
       const headline = breakingHeadlines[headlineIndex % breakingHeadlines.length];
       headlineIndex++;
       publish({
@@ -1084,7 +1237,7 @@ function handleIndex() {
       });
     });
 
-    document.getElementById("score-btn").addEventListener("click", () => {
+    scoreBtn.addEventListener("click", () => {
       const isHome = Math.random() > 0.5;
       publish({
         type: "score-update",
@@ -1098,8 +1251,55 @@ function handleIndex() {
       });
     });
 
+    // --- Auto-Demo Mode ---
+    let autoDemoRunning = false;
+    const autoHeadlines = [
+      "Injury report: star forward listed as day-to-day",
+      "Overtime thriller ends with buzzer-beater three",
+      "League MVP voting results announced",
+      "Playoff bracket set after final regular season games",
+      "Rookie sensation breaks scoring record",
+      "Historic comeback: team rallies from 25-point deficit",
+    ];
+
+    function startAutoDemo() {
+      if (autoDemoRunning) return;
+      autoDemoRunning = true;
+      let autoIndex = 0;
+
+      setInterval(() => {
+        autoIndex++;
+        const isScore = autoIndex % 3 !== 0;
+        let event;
+
+        if (isScore) {
+          const side = Math.random() > 0.5;
+          if (side) homeScore++; else awayScore++;
+          event = {
+            type: "score-update",
+            payload: { homeTeam: "HOME", awayTeam: "AWAY", homeScore, awayScore, timestamp: Date.now() },
+          };
+        } else {
+          event = {
+            type: "breaking-news",
+            payload: { headline: autoHeadlines[autoIndex % autoHeadlines.length], timestamp: Date.now() },
+          };
+        }
+
+        animateArchDiagram();
+        handleEvent(event);
+        updateDashboard({
+          subscribers: "demo",
+          payloadBytes: new TextEncoder().encode(JSON.stringify(event)).length,
+          broadcastMs: (Math.random() * 0.3).toFixed(3),
+          mode: "auto-demo",
+        });
+      }, 4000 + Math.random() * 3000);
+    }
+
     // --- Init ---
     connectSSE();
+    updateBudgetUI();
   </script>
 </body>
 </html>`;

@@ -8,4 +8,22 @@ manifest_version = 3
 name = "fastly-fanout-notifications"
 service_id = "BKmWamddLVjNVxq6Grt3We"
 
-[local_server]
+[setup.backends.self]
+address = "127.0.0.1"
+port = 7676
+
+[setup.backends.fanout_publish]
+address = "api.fastly.com"
+port = 443
+
+[setup.kv_stores.notification-history]
+
+[local_server.backends.self]
+url = "http://127.0.0.1:7676"
+
+[local_server.backends.fanout_publish]
+url = "https://api.fastly.com"
+
+[local_server.kv_stores."notification-history"]
+file = "kv-data.json"
+format = "json"

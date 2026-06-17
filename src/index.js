@@ -1,5 +1,10 @@
 /// <reference types="@fastly/js-compute" />
 
+import { createFanoutHandoff } from "fastly:fanout";
+import { env } from "fastly:env";
+import { KVStore } from "fastly:kv-store";
+import { SecretStore } from "fastly:secret-store";
+
 class EventBus {
   constructor() {
     this.subscribers = new Map();
@@ -72,6 +77,87 @@ function sanitizeEvent(raw) {
   return clean;
 }
 
+const KV_STORE_NAME = "notification-history";
+const KV_MAX_HISTORY = 20;
+
+function getKVStore() {
+  try {
+    return new KVStore(KV_STORE_NAME);
+  } catch {
+    return null;
+  }
+}
+
+async function storeEvent(event) {
+  const store = getKVStore();
+  if (!store) return;
+  try {
+    const key = `event:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`;
+    await store.put(key, JSON.stringify(event), { ttl: 86400 });
+  } catch {
+    // KV write failure is non-fatal
+  }
+}
+
+async function getRecentEvents() {
+  const store = getKVStore();
+  if (!store) return [];
+  try {
+    const { list: keys } = await store.list({ prefix: "event:", limit: KV_MAX_HISTORY });
+    const events = [];
+    for (const key of keys) {
+      try {
+        const entry = await store.get(key);
+        if (entry) events.push(await entry.json());
+      } catch {
+        // skip corrupted entries
+      }
+    }
+    events.sort((a, b) => (b.payload?.timestamp || 0) - (a.payload?.timestamp || 0));
+    return events.slice(0, KV_MAX_HISTORY);
+  } catch {
+    return [];
+  }
+}
+
+async function fanoutPublish(event) {
+  const sseFrame = `event: notification\ndata: ${JSON.stringify(event)}\n\n`;
+  const serviceId = env("FASTLY_SERVICE_ID");
+  if (!serviceId) throw new Error("No service ID");
+
+  const secrets = new SecretStore("fanout-secrets");
+  const tokenEntry = await secrets.get("fastly-api-token");
+  if (!tokenEntry) throw new Error("No API token");
+  const apiToken = tokenEntry.plaintext();
+  if (!apiToken) throw new Error("Empty API token");
+
+  const response = await fetch(
+    `https://api.fastly.com/service/${serviceId}/publish/`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Fastly-Key": apiToken,
+      },
+      body: JSON.stringify({
+        items: [{
+          channel: "notifications",
+          formats: { "http-stream": { content: sseFrame } },
+        }],
+      }),
+      backend: "fanout_publish",
+    }
+  );
+
+  if (!response.ok) throw new Error("Fanout publish failed");
+
+  return {
+    subscribers: "edge",
+    payloadBytes: new TextEncoder().encode(sseFrame).length,
+    broadcastMs: 0,
+  };
+}
+
 addEventListener("fetch", (event) => event.respondWith(handleRequest(event)));
 
 async function handleRequest(event) {
@@ -89,15 +175,53 @@ async function handleRequest(event) {
   }
 }
 
-function handleSubscribe(event) {
+async function handleSubscribe(event) {
+  const req = event.request;
+  const gripSig = req.headers.get("Grip-Sig");
+
+  // Production: Fanout-relayed request (has Grip-Sig)
+  if (gripSig) {
+    const history = await getRecentEvents();
+    const historyFrames = history.reverse().map((evt) =>
+      `event: notification\ndata: ${JSON.stringify(evt)}\n\n`
+    ).join("");
+    const init = `event: connected\ndata: ${JSON.stringify({ mode: "fanout" })}\n\n`;
+
+    return secureResponse(init + historyFrames, {
+      status: 200,
+      headers: {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        "Grip-Hold": "stream",
+        "Grip-Channel": "notifications",
+        "Grip-Keep-Alive": "\\n; format=cstring; timeout=20",
+      },
+    });
+  }
+
+  // Production: Fanout handoff (skip in Viceroy — it can't handle it)
+  try {
+    const hostname = env("FASTLY_HOSTNAME");
+    if (hostname && hostname !== "localhost") {
+      return createFanoutHandoff(req, "self");
+    }
+  } catch {
+    // env() or handoff failed — fall through to EventBus
+  }
+
+  // Local: EventBus fallback
   const { readable, writable } = new TransformStream();
   const writer = writable.getWriter();
   const id = ++subscriberIdCounter;
-
   eventBus.subscribe(id, writer);
 
-  const initMessage = `event: connected\ndata: ${JSON.stringify({ subscriberId: id })}\n\n`;
-  writer.write(new TextEncoder().encode(initMessage));
+  const init = `event: connected\ndata: ${JSON.stringify({ subscriberId: id, mode: "local" })}\n\n`;
+  writer.write(new TextEncoder().encode(init));
+
+  const history = await getRecentEvents();
+  for (const evt of history.reverse()) {
+    writer.write(new TextEncoder().encode(`event: notification\ndata: ${JSON.stringify(evt)}\n\n`));
+  }
 
   return secureResponse(readable, {
     status: 200,
@@ -105,8 +229,6 @@ function handleSubscribe(event) {
       "Content-Type": "text/event-stream",
       "Cache-Control": "no-cache",
       "Connection": "keep-alive",
-      "Grip-Hold": "stream",
-      "Grip-Channel": "notifications",
     },
   });
 }
@@ -144,13 +266,25 @@ async function handlePublish(event) {
     });
   }
 
-  const stats = eventBus.publish(sanitized);
+  const storePromise = storeEvent(sanitized);
+
+  let stats;
+  let mode;
+  try {
+    stats = await fanoutPublish(sanitized);
+    mode = "fanout";
+  } catch {
+    stats = eventBus.publish(sanitized);
+    mode = "local";
+  }
+
+  await storePromise.catch(() => {});
 
   return secureResponse(
     JSON.stringify({
       success: true,
       event: sanitized,
-      broadcast: stats,
+      broadcast: { ...stats, mode },
     }),
     {
       status: 200,
@@ -172,29 +306,31 @@ function handleIndex() {
     * { margin: 0; padding: 0; box-sizing: border-box; }
 
     :root {
-      --fastly-red: #ff282d;
-      --coral: #ff6b6b;
-      --electric-violet: #7c3aed;
-      --vivid-blue: #3b82f6;
-      --emerald: #10b981;
-      --amber: #f59e0b;
-      --hot-pink: #ec4899;
-      --gradient-hero: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-      --gradient-fire: linear-gradient(135deg, #ff282d 0%, #ff6b6b 50%, #f59e0b 100%);
-      --gradient-ocean: linear-gradient(135deg, #3b82f6 0%, #7c3aed 100%);
-      --gradient-mesh: radial-gradient(at 20% 80%, rgba(124,58,237,0.08) 0%, transparent 50%),
-                        radial-gradient(at 80% 20%, rgba(59,130,246,0.08) 0%, transparent 50%),
-                        radial-gradient(at 50% 50%, rgba(255,40,45,0.04) 0%, transparent 60%);
-      --glow-red: 0 0 20px rgba(255,40,45,0.35), 0 0 60px rgba(255,40,45,0.1);
-      --glow-violet: 0 0 20px rgba(124,58,237,0.35), 0 0 60px rgba(124,58,237,0.1);
-      --glow-blue: 0 0 20px rgba(59,130,246,0.35), 0 0 60px rgba(59,130,246,0.1);
+      --bg: #f8fafc;
+      --surface: #ffffff;
+      --primary: #6366f1;
+      --primary-hover: #4f46e5;
+      --primary-light: #eef2ff;
+      --secondary: #475569;
+      --text: #0f172a;
+      --text-secondary: #64748b;
+      --text-muted: #94a3b8;
+      --success: #22c55e;
+      --alert: #ef4444;
+      --alert-hover: #dc2626;
+      --alert-light: #fef2f2;
+      --border: #e2e8f0;
+      --border-light: #f1f5f9;
+      --shadow-sm: 0 1px 2px rgba(0,0,0,0.05);
+      --shadow-md: 0 4px 6px -1px rgba(0,0,0,0.07), 0 2px 4px -2px rgba(0,0,0,0.05);
+      --shadow-lg: 0 10px 15px -3px rgba(0,0,0,0.07), 0 4px 6px -4px rgba(0,0,0,0.05);
+      --radius: 12px;
     }
 
     body {
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-      background: #f0f2f5;
-      background-image: var(--gradient-mesh);
-      color: #333;
+      background: var(--bg);
+      color: var(--text);
       height: 100vh;
       overflow: hidden;
       display: flex;
@@ -202,36 +338,29 @@ function handleIndex() {
     }
 
     .top-bar {
-      background: linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%);
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
       padding: 14px 24px;
       display: flex;
       align-items: center;
       gap: 14px;
       flex-shrink: 0;
-      box-shadow: 0 4px 20px rgba(0,0,0,0.15);
     }
 
     .top-bar h1 {
-      font-size: 17px;
+      font-size: 16px;
       font-weight: 700;
-      color: #fff;
-      letter-spacing: 0.5px;
+      color: var(--text);
     }
 
     .top-bar .badge {
-      background: var(--gradient-fire);
+      background: var(--primary);
       color: #fff;
       font-size: 10px;
-      font-weight: 700;
+      font-weight: 600;
       padding: 3px 10px;
       border-radius: 12px;
-      letter-spacing: 1px;
-      animation: badge-pulse 2s ease-in-out infinite;
-    }
-
-    @keyframes badge-pulse {
-      0%, 100% { box-shadow: 0 0 8px rgba(255,40,45,0.4); }
-      50% { box-shadow: 0 0 16px rgba(255,40,45,0.7), 0 0 32px rgba(255,107,107,0.3); }
+      letter-spacing: 0.5px;
     }
 
     .main {
@@ -244,20 +373,19 @@ function handleIndex() {
     }
 
     .panel {
-      background: rgba(255,255,255,0.85);
-      backdrop-filter: blur(12px);
-      border-radius: 16px;
-      border: 1px solid rgba(255,255,255,0.6);
+      background: var(--surface);
+      border-radius: var(--radius);
+      border: 1px solid var(--border);
       padding: 20px;
       display: flex;
       flex-direction: column;
       overflow: hidden;
-      box-shadow: 0 4px 24px rgba(0,0,0,0.06), 0 1px 4px rgba(0,0,0,0.04);
-      transition: box-shadow 0.3s ease;
+      box-shadow: var(--shadow-sm);
+      transition: box-shadow 0.2s ease;
     }
 
     .panel:hover {
-      box-shadow: 0 8px 32px rgba(0,0,0,0.1), 0 2px 8px rgba(0,0,0,0.06);
+      box-shadow: var(--shadow-md);
     }
 
     .panel-title {
@@ -265,10 +393,7 @@ function handleIndex() {
       font-weight: 700;
       text-transform: uppercase;
       letter-spacing: 1.5px;
-      background: var(--gradient-ocean);
-      -webkit-background-clip: text;
-      -webkit-text-fill-color: transparent;
-      background-clip: text;
+      color: var(--text-secondary);
       margin-bottom: 16px;
     }
 
@@ -276,55 +401,45 @@ function handleIndex() {
     .publisher-actions {
       display: flex;
       flex-direction: column;
-      gap: 14px;
+      gap: 12px;
       flex: 1;
       justify-content: center;
     }
 
     .publish-btn {
-      padding: 16px 20px;
+      padding: 14px 20px;
       border: none;
-      border-radius: 12px;
+      border-radius: var(--radius);
       font-size: 14px;
-      font-weight: 700;
+      font-weight: 600;
       cursor: pointer;
-      transition: transform 0.15s, box-shadow 0.3s;
-      position: relative;
-      overflow: hidden;
-    }
-
-    .publish-btn::after {
-      content: '';
-      position: absolute;
-      inset: 0;
-      background: linear-gradient(rgba(255,255,255,0.2), transparent);
-      pointer-events: none;
+      transition: all 0.15s ease;
     }
 
     .publish-btn:active {
-      transform: scale(0.96);
+      transform: scale(0.97);
     }
 
     .btn-breaking {
-      background: var(--gradient-fire);
+      background: var(--alert);
       color: #fff;
-      box-shadow: 0 4px 16px rgba(255, 40, 45, 0.35);
+      box-shadow: var(--shadow-sm);
     }
 
     .btn-breaking:hover {
-      box-shadow: var(--glow-red);
-      transform: translateY(-1px);
+      background: var(--alert-hover);
+      box-shadow: var(--shadow-md);
     }
 
     .btn-score {
-      background: var(--gradient-ocean);
+      background: var(--primary);
       color: #fff;
-      box-shadow: 0 4px 16px rgba(59,130,246,0.3);
+      box-shadow: var(--shadow-sm);
     }
 
     .btn-score:hover {
-      box-shadow: var(--glow-blue);
-      transform: translateY(-1px);
+      background: var(--primary-hover);
+      box-shadow: var(--shadow-md);
     }
 
     /* Phone Mockup */
@@ -339,17 +454,17 @@ function handleIndex() {
       width: 280px;
       height: 100%;
       max-height: 480px;
-      background: #fff;
+      background: var(--surface);
       border-radius: 32px;
-      border: 3px solid #1a1a2e;
-      box-shadow: 0 8px 40px rgba(0,0,0,0.15), 0 0 0 1px rgba(255,255,255,0.1) inset;
+      border: 3px solid var(--text);
+      box-shadow: var(--shadow-lg);
       overflow: hidden;
       display: flex;
       flex-direction: column;
     }
 
     .phone-status-bar {
-      background: linear-gradient(135deg, #1a1a2e 0%, #0f3460 100%);
+      background: var(--text);
       color: #fff;
       font-size: 11px;
       padding: 8px 16px 6px;
@@ -359,18 +474,16 @@ function handleIndex() {
     }
 
     .status-dot {
-      width: 7px;
-      height: 7px;
+      width: 6px;
+      height: 6px;
       border-radius: 50%;
-      background: var(--emerald);
+      background: var(--success);
       display: inline-block;
       margin-right: 6px;
-      box-shadow: 0 0 8px rgba(16,185,129,0.6);
     }
 
     .status-dot.disconnected {
-      background: var(--fastly-red);
-      box-shadow: 0 0 8px rgba(255,40,45,0.6);
+      background: var(--alert);
       animation: blink 1s infinite;
     }
 
@@ -390,7 +503,7 @@ function handleIndex() {
       display: flex;
       flex-direction: column;
       justify-content: center;
-      border-bottom: 1px solid #eee;
+      border-bottom: 1px solid var(--border);
       position: relative;
       overflow: hidden;
     }
@@ -400,12 +513,12 @@ function handleIndex() {
       font-weight: 700;
       text-transform: uppercase;
       letter-spacing: 1px;
-      color: var(--fastly-red);
+      color: var(--alert);
       margin-bottom: 8px;
     }
 
     .news-banner {
-      background: #fff;
+      background: var(--surface);
       border-left: 3px solid transparent;
       padding: 10px 12px;
       border-radius: 8px;
@@ -418,17 +531,16 @@ function handleIndex() {
     }
 
     .news-banner.active {
-      border-left-color: var(--fastly-red);
-      background: linear-gradient(135deg, #fff5f5 0%, #fff0f6 100%);
+      border-left-color: var(--alert);
+      background: var(--alert-light);
       opacity: 1;
       transform: translateY(0);
-      box-shadow: 0 2px 12px rgba(255,40,45,0.1);
     }
 
     .news-banner .time {
       font-size: 10px;
       font-weight: 400;
-      color: #999;
+      color: var(--text-muted);
       margin-top: 4px;
     }
 
@@ -439,7 +551,7 @@ function handleIndex() {
       flex-direction: column;
       justify-content: center;
       align-items: center;
-      background: linear-gradient(180deg, #fff 0%, #f8faff 100%);
+      background: var(--border-light);
     }
 
     .score-label {
@@ -447,7 +559,7 @@ function handleIndex() {
       font-weight: 700;
       text-transform: uppercase;
       letter-spacing: 1px;
-      color: var(--vivid-blue);
+      color: var(--primary);
       margin-bottom: 12px;
     }
 
@@ -464,31 +576,25 @@ function handleIndex() {
     .team-name {
       font-size: 12px;
       font-weight: 600;
-      color: #666;
+      color: var(--text-secondary);
       margin-bottom: 4px;
     }
 
     .team-score {
       font-size: 36px;
       font-weight: 800;
-      background: var(--gradient-ocean);
-      -webkit-background-clip: text;
-      -webkit-text-fill-color: transparent;
-      background-clip: text;
-      transition: transform 0.2s ease;
+      color: var(--text);
+      transition: transform 0.2s ease, color 0.2s ease;
     }
 
     .team-score.bumped {
       transform: scale(1.3);
-      background: var(--gradient-fire);
-      -webkit-background-clip: text;
-      -webkit-text-fill-color: transparent;
-      background-clip: text;
+      color: var(--primary);
     }
 
     .score-divider {
       font-size: 20px;
-      color: #ccc;
+      color: var(--text-muted);
       font-weight: 300;
     }
 
@@ -505,19 +611,14 @@ function handleIndex() {
       justify-content: space-between;
       align-items: center;
       padding: 10px 12px;
-      border-radius: 10px;
-      background: linear-gradient(135deg, #f8f9ff 0%, #f0f4ff 100%);
-      border: 1px solid rgba(59,130,246,0.08);
-      transition: border-color 0.3s;
-    }
-
-    .stat-row:hover {
-      border-color: rgba(59,130,246,0.2);
+      border-radius: 8px;
+      background: var(--border-light);
+      border: 1px solid var(--border);
     }
 
     .stat-label {
       font-size: 12px;
-      color: #666;
+      color: var(--text-secondary);
       font-weight: 500;
     }
 
@@ -525,15 +626,12 @@ function handleIndex() {
       font-size: 14px;
       font-weight: 700;
       font-variant-numeric: tabular-nums;
-      background: var(--gradient-ocean);
-      -webkit-background-clip: text;
-      -webkit-text-fill-color: transparent;
-      background-clip: text;
+      color: var(--primary);
     }
 
     .stat-note {
       font-size: 10px;
-      color: #999;
+      color: var(--text-muted);
       font-style: italic;
       line-height: 1.4;
       padding: 8px 0;
@@ -544,10 +642,7 @@ function handleIndex() {
       font-weight: 700;
       text-transform: uppercase;
       letter-spacing: 1.5px;
-      background: var(--gradient-hero);
-      -webkit-background-clip: text;
-      -webkit-text-fill-color: transparent;
-      background-clip: text;
+      color: var(--text-secondary);
       margin-bottom: 8px;
     }
 
@@ -563,32 +658,29 @@ function handleIndex() {
       padding: 5px 6px;
       margin-bottom: 2px;
       border-radius: 6px;
-      background: linear-gradient(135deg, rgba(255,40,45,0.03) 0%, rgba(124,58,237,0.03) 100%);
+      background: var(--border-light);
       display: flex;
       gap: 8px;
-      transition: background 0.2s;
+      transition: background 0.15s;
     }
 
     .log-entry:hover {
-      background: linear-gradient(135deg, rgba(255,40,45,0.08) 0%, rgba(124,58,237,0.08) 100%);
+      background: var(--primary-light);
     }
 
     .log-time {
-      color: #999;
+      color: var(--text-muted);
       flex-shrink: 0;
     }
 
     .log-type {
-      background: var(--gradient-fire);
-      -webkit-background-clip: text;
-      -webkit-text-fill-color: transparent;
-      background-clip: text;
+      color: var(--primary);
       font-weight: 700;
       flex-shrink: 0;
     }
 
     .log-detail {
-      color: #555;
+      color: var(--text-secondary);
       overflow: hidden;
       text-overflow: ellipsis;
       white-space: nowrap;
@@ -597,9 +689,8 @@ function handleIndex() {
     /* Architecture Diagram */
     .arch-strip {
       flex: 3;
-      background: linear-gradient(180deg, rgba(255,255,255,0.9) 0%, rgba(240,242,255,0.95) 100%);
-      border-top: 2px solid transparent;
-      border-image: linear-gradient(90deg, var(--fastly-red), var(--electric-violet), var(--vivid-blue)) 1;
+      background: var(--surface);
+      border-top: 1px solid var(--border);
       padding: 16px 24px;
       display: flex;
       flex-direction: column;
@@ -613,10 +704,7 @@ function handleIndex() {
       font-weight: 700;
       text-transform: uppercase;
       letter-spacing: 1.5px;
-      background: var(--gradient-hero);
-      -webkit-background-clip: text;
-      -webkit-text-fill-color: transparent;
-      background-clip: text;
+      color: var(--text-secondary);
       margin-bottom: 12px;
     }
 
@@ -631,42 +719,31 @@ function handleIndex() {
     }
 
     .arch-node {
-      background: linear-gradient(135deg, #fff 0%, #f8f9ff 100%);
-      border: 2px solid #e0e0e0;
-      border-radius: 10px;
+      background: var(--surface);
+      border: 2px solid var(--border);
+      border-radius: 8px;
       padding: 10px 16px;
       font-size: 12px;
-      font-weight: 700;
+      font-weight: 600;
       text-align: center;
       transition: box-shadow 0.3s, border-color 0.3s, transform 0.3s;
       z-index: 1;
       white-space: nowrap;
-      color: #333;
-    }
-
-    .arch-node:first-child {
-      border-color: var(--fastly-red);
-      box-shadow: 0 2px 8px rgba(255,40,45,0.1);
-    }
-
-    .arch-node:last-child {
-      border-color: var(--vivid-blue);
-      box-shadow: 0 2px 8px rgba(59,130,246,0.1);
+      color: var(--text);
     }
 
     .arch-node.glow {
-      border-color: var(--electric-violet);
-      box-shadow: var(--glow-violet);
+      border-color: var(--primary);
+      box-shadow: 0 0 0 3px rgba(99,102,241,0.15);
       transform: scale(1.05);
     }
 
     .arch-connector {
       flex: 1;
       height: 2px;
-      background: linear-gradient(90deg, var(--fastly-red), var(--electric-violet), var(--vivid-blue));
+      background: var(--border);
       position: relative;
       min-width: 40px;
-      opacity: 0.5;
     }
 
     .arch-connector-label {
@@ -675,22 +752,22 @@ function handleIndex() {
       left: 50%;
       transform: translateX(-50%);
       font-size: 9px;
-      color: #999;
+      color: var(--text-muted);
       white-space: nowrap;
       font-weight: 500;
     }
 
     .arch-dot {
       position: absolute;
-      width: 10px;
-      height: 10px;
-      background: var(--gradient-fire);
+      width: 8px;
+      height: 8px;
+      background: var(--primary);
       border-radius: 50%;
-      top: -4px;
+      top: -3px;
       left: 0;
       opacity: 0;
       z-index: 2;
-      box-shadow: 0 0 12px rgba(255,40,45,0.6);
+      box-shadow: 0 0 8px rgba(99,102,241,0.4);
     }
 
     .arch-dot.animate {
@@ -705,7 +782,7 @@ function handleIndex() {
 
     .arch-caption {
       font-size: 11px;
-      color: #888;
+      color: var(--text-muted);
       margin-top: 12px;
       text-align: center;
       font-style: italic;
@@ -801,18 +878,18 @@ function handleIndex() {
       </div>
       <div class="arch-node" id="arch-auth">Auth + Sanitize</div>
       <div class="arch-connector">
-        <span class="arch-connector-label">EventBus</span>
+        <span class="arch-connector-label" id="arch-transport-label">EventBus</span>
         <div class="arch-dot" id="arch-dot-2"></div>
       </div>
-      <div class="arch-node" id="eventbus-node">EventBus</div>
+      <div class="arch-node" id="eventbus-node"><span id="transport-node-label">EventBus</span></div>
       <div class="arch-connector">
         <span class="arch-connector-label">SSE stream</span>
         <div class="arch-dot" id="arch-dot-3"></div>
       </div>
       <div class="arch-node" id="arch-client">Client</div>
     </div>
-    <div class="arch-caption">
-      In production, Fastly Fanout replaces the EventBus — holding connections at 90+ global edge PoPs
+    <div class="arch-caption" id="arch-caption">
+      Detecting runtime mode...
     </div>
   </div>
 
@@ -838,8 +915,23 @@ function handleIndex() {
       const status = document.getElementById("connection-status");
 
       evtSource.addEventListener("connected", (e) => {
+        const data = JSON.parse(e.data);
         dot.classList.remove("disconnected");
         status.textContent = "Connected";
+
+        const transportLabel = document.getElementById("arch-transport-label");
+        const transportNode = document.getElementById("transport-node-label");
+        const caption = document.getElementById("arch-caption");
+
+        if (data.mode === "fanout") {
+          transportLabel.textContent = "Fanout API";
+          transportNode.textContent = "Fanout";
+          caption.textContent = "Connected via Fastly Fanout — connections held at the edge across 90+ global PoPs";
+        } else {
+          transportLabel.textContent = "EventBus";
+          transportNode.textContent = "EventBus";
+          caption.textContent = "Running locally via EventBus — in production, Fastly Fanout holds connections at the edge";
+        }
       });
 
       evtSource.addEventListener("notification", (e) => {
@@ -901,9 +993,11 @@ function handleIndex() {
 
     // --- Dashboard ---
     function updateDashboard(broadcastStats) {
-      document.getElementById("connections-count").textContent = broadcastStats.subscribers;
+      document.getElementById("connections-count").textContent =
+        broadcastStats.subscribers === "edge" ? "Edge (Fanout)" : broadcastStats.subscribers;
       document.getElementById("payload-size").textContent = broadcastStats.payloadBytes + " bytes";
-      document.getElementById("broadcast-latency").textContent = broadcastStats.broadcastMs + " ms";
+      document.getElementById("broadcast-latency").textContent =
+        broadcastStats.mode === "fanout" ? "<1ms (edge)" : broadcastStats.broadcastMs + " ms";
     }
 
     function addLogEntry(event) {
